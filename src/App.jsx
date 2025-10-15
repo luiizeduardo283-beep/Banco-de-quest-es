@@ -9,6 +9,9 @@ import { AREAS_CONHECIMENTO, INCIDENCE_CATS, DIFICULDADE_OPCOES, SIMULADOS } fro
 /* Utilitário simples para gerar IDs */
 const uid = () => Math.random().toString(36).slice(2, 9);
 
+// Configurável via Vite env: VITE_API_BASE
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
+
 const defaultQuestions = [
   {
     id: "q1",
@@ -27,7 +30,7 @@ const defaultQuestions = [
     enunciado: "Qual é a fórmula molecular da glicose?",
     imagem: "",
     referencias: "Livro de Química Orgânica - Volume 1",
-    alternativas: [
+    alternatives: [
       { label: "A", text: "C6H12O6", correct: true },
       { label: "B", text: "C12H22O11" },
       { label: "C", text: "CH4" },
@@ -411,28 +414,7 @@ function QuestionModal({ isOpen, onClose, editing, form, setForm, onSave }) {
 }
 
 export default function App() {
-  // questions (persistidas em localStorage)
-  const [questions, setQuestions] = useState(() => {
-    try {
-      const raw = localStorage.getItem("bq_questions_v1");
-      if (raw) return JSON.parse(raw);
-    } catch (e) {}
-    return defaultQuestions;
-  });
-
-  // filtros / busca
-  const [query, setQuery] = useState("");
-  const [discipline, setDiscipline] = useState("Todas as Disciplinas");
-  const [simulado, setSimulado] = useState("Todos os Simulados");
-  const [numeroQuestao, setNumeroQuestao] = useState("");
-
-  // modal / edição / deleção
-  const [modalOpen, setModalOpen] = useState(false);
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const [editing, setEditing] = useState(null);
-  const [toDeleteId, setToDeleteId] = useState(null);
-
-  // form fields (sincronizados com editing)
+  // form vazio usado no modal
   const emptyForm = {
     simulado: "",
     numeroQuestao: "",
@@ -460,6 +442,32 @@ export default function App() {
     marcada: "",
     explicacao: "",
   };
+
+  // questions (persistidas em localStorage) - inicial
+  const [questions, setQuestions] = useState(() => {
+    try {
+      const raw = localStorage.getItem("bq_questions_v1");
+      if (raw) return JSON.parse(raw);
+    } catch (e) {}
+    return defaultQuestions;
+  });
+
+  // indicador se carregamos do servidor
+  const [loadedFromServer, setLoadedFromServer] = useState(false);
+
+  // filtros / busca
+  const [query, setQuery] = useState("");
+  const [discipline, setDiscipline] = useState("Todas as Disciplinas");
+  const [simulado, setSimulado] = useState("Todos os Simulados");
+  const [numeroQuestao, setNumeroQuestao] = useState("");
+
+  // modal / edição / deleção
+  const [modalOpen, setModalOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [toDeleteId, setToDeleteId] = useState(null);
+
+  // form fields (sincronizados com editing)
   const [form, setForm] = useState(emptyForm);
 
   // persistir sempre que perguntas mudarem
@@ -481,13 +489,178 @@ export default function App() {
 
   const simuladosOptions = ["Todos os Simulados", ...SIMULADOS];
 
-  // filtrar
+  // ------- NOVO: consumir API /api/questions (GET) com logs de debug e normalização adaptada -----
+  useEffect(() => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout enquanto debug
+
+    async function loadFromApi() {
+      try {
+        const res = await fetch(`${API_BASE}/api/questions?limit=1000`, { signal: controller.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        console.log("[App] RAW data from /api/questions:", data);
+        if (!Array.isArray(data)) throw new Error("Resposta da API não é um array");
+
+        // Normaliza documentos do Mongo para o shape esperado pelo front
+        const normalized = data.map(doc => normalizeDoc(doc));
+        console.log("[App] normalized sample (first 3):", normalized.slice(0, 3));
+        setQuestions(normalized);
+        setLoadedFromServer(true);
+        console.log(`[App] ${normalized.length} questões carregadas do servidor (${API_BASE})`);
+      } catch (err) {
+        console.warn("[App] não foi possível carregar do servidor:", err.message || err);
+        setLoadedFromServer(false);
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    loadFromApi();
+
+    return () => {
+      controller.abort();
+      clearTimeout(timeout);
+    };
+  }, []); // roda apenas no mount
+
+  // Função para transformar o documento do Mongo no shape do front (adaptada ao seu schema)
+  function normalizeDoc(doc) {
+    // fallback para alternativas (A..E)
+    const fallbackAlts = emptyForm.alternatives.map(a => ({ ...a }));
+
+    // Helper: parseia a string JSON de alternativas que você tem no banco
+    function parseAlternativesField(field) {
+      if (!field) return null;
+
+      // se já for objeto com chaves "A","B"... converte direto
+      if (typeof field === "object" && !Array.isArray(field)) {
+        return Object.entries(field).map(([label, text]) => ({
+          label: String(label).toUpperCase(),
+          text: String(text || "")
+        }));
+      }
+
+      if (typeof field === "string") {
+        // algumas strings vêm com aspas escapadas; tentamos parse seguro
+        try {
+          // Tenta parse direto como JSON
+          const parsed = JSON.parse(field);
+          if (parsed && typeof parsed === "object") {
+            return Object.entries(parsed).map(([label, text]) => ({
+              label: String(label).toUpperCase(),
+              text: String(text || "")
+            }));
+          }
+        } catch (err) {
+          // se falhar, tentamos extrair pares "A": "texto" via regex (fallback)
+          try {
+            const obj = {};
+            // encontra "A": "valor" ou 'A': 'valor'
+            const re = /["']?([A-Ea-e])["']?\s*:\s*["']([^"']+)["']/g;
+            let m;
+            while ((m = re.exec(field)) !== null) {
+              obj[m[1].toUpperCase()] = m[2];
+            }
+            if (Object.keys(obj).length) {
+              return Object.entries(obj).map(([label, text]) => ({ label, text }));
+            }
+          } catch (e) {
+            // nada
+          }
+        }
+      }
+      return null;
+    }
+
+    // tenta localizar alternativas em várias chaves possíveis
+    let alts = null;
+    alts = parseAlternativesField(doc.Alternativas) || parseAlternativesField(doc.AlternativasText) || alts;
+    if (!alts && Array.isArray(doc.Alternativas)) {
+      // se por acaso for array já
+      alts = doc.Alternativas.map((a, i) => normalizeAlt(a, i));
+    }
+    if (!alts) {
+      // fallback genérico: procurar por 'alternatives', 'options', 'opcoes'
+      if (Array.isArray(doc.alternatives)) alts = doc.alternatives.map((a, i) => normalizeAlt(a, i));
+      else if (Array.isArray(doc.options)) alts = doc.options.map((a, i) => normalizeAlt(a, i));
+      else alts = fallbackAlts;
+    }
+
+    // ID: preferir campo ID, senão _id (objeto), senão gerar uid
+    let idValue = (doc.ID && String(doc.ID)) || "";
+    if (!idValue && doc._id) {
+      if (typeof doc._id === "string") idValue = doc._id;
+      else if (doc._id.$oid) idValue = doc._id.$oid;
+      else idValue = String(doc._id);
+    }
+    if (!idValue) idValue = uid();
+
+    // Mapear campos (respeitando maiúsculas e espaços do seu documento)
+    const simulado = doc.Simulado || doc.simulado || "";
+    const numeroQuestao = doc["Questão Nº"] || doc["Questão Nº"] || doc.numero || doc.numeroQuestao || "";
+    const disciplina = doc.Disciplina || doc.disciplina || doc.discipline || "";
+    const assunto = doc.Assunto || doc.assunto || doc.Subject || "";
+    const topico = doc["Tópico"] || doc.Topico || doc.topic || "";
+    const area = doc["Área"] || doc.Area || doc.area || "";
+    const incidencia = doc["Incidência"] || doc.Incidencia || doc.incidence || "";
+    const dificuldade = doc["Dificuldade"] || doc.dificuldade || "Médio";
+    const resultado = doc["Resultado"] || doc.resultado || "Certo";
+    const motivoErro = doc["MotivoErro"] || doc.MotivoErro || doc.motivo_erro || "";
+    const competencia = doc.Competencia || doc["Competência"] || doc.competence || "";
+    const habilidade = doc.Habilidade || doc.habilidade || "";
+    const enunciado = doc.Enunciado || doc.enunciado || doc.Question || doc.question || "";
+    const imagem = doc.Imagem || doc.image || "";
+    const referencias = doc.Referencias || doc["Referências"] || doc.references || "";
+    const gabarito = doc.Gabarito || doc.Gabarito || doc.answer || "";
+    const marcada = doc.Marquei || doc.Marquei || doc.Marcada || "";
+
+    return {
+      id: idValue,
+      simulado: String(simulado || ""),
+      numeroQuestao: String(numeroQuestao || ""),
+      disciplina: String(disciplina || ""),
+      assunto: String(assunto || ""),
+      topico: String(topico || ""),
+      area: String(area || ""),
+      incidencia: String(incidencia || ""),
+      dificuldade: String(dificuldade || ""),
+      resultado: String(resultado || ""),
+      motivoErro: String(motivoErro || ""),
+      competencia: String(competencia || ""),
+      habilidade: String(habilidade || ""),
+      enunciado: String(enunciado || ""),
+      imagem: String(imagem || ""),
+      referencias: String(referencias || ""),
+      alternatives: alts,
+      gabarito: String(gabarito || (alts[0] && alts[0].label) || "A"),
+      marcada: String(marcada || ""),
+      explicacao: String(doc.Explicacao || doc["Explicação"] || doc.explicacao || doc.explanation || ""),
+      _raw: doc
+    };
+  }
+
+  function normalizeAlt(a, index) {
+    if (!a) return { label: String.fromCharCode(65 + index), text: "" };
+    if (typeof a === "string") return { label: String.fromCharCode(65 + index), text: a };
+    // se for par label->texto ou objeto {A: '10', B: '11'} -> adaptamos em caller
+    return {
+      label: a.label || a.letra || a.key || String.fromCharCode(65 + index),
+      text: a.text || a.texto || a.value || a.answer || ""
+    };
+  }
+  // -----------------------------------------------------------------
+
+  // filtrar (agora também procura dentro de _raw como fallback)
   const filtered = questions.filter((q) => {
-    const text = (q.enunciado + " " + q.assunto + " " + q.disciplina).toLowerCase();
+    // concatena campos conhecidos + fallback para todo o _raw (stringificado) para aumentar chance de match
+    const rawText = JSON.stringify(q._raw || {});
+    const text = ((q.enunciado || "") + " " + (q.assunto || "") + " " + (q.disciplina || "") + " " + rawText).toLowerCase();
     const matchesQuery = !query || text.includes(query.toLowerCase());
     const matchesDiscipline = discipline === "Todas as Disciplinas" || q.disciplina === discipline;
     const matchesSimulado = simulado === "Todos os Simulados" || q.simulado === simulado;
-    const matchesNumero = !numeroQuestao || q.numeroQuestao.toString().includes(numeroQuestao);
+    const matchesNumero = !numeroQuestao || (q.numeroQuestao && q.numeroQuestao.toString().includes(numeroQuestao));
     
     return matchesQuery && matchesDiscipline && matchesSimulado && matchesNumero;
   });
@@ -534,7 +707,7 @@ export default function App() {
     setModalOpen(true);
   }
 
-  // salvar (novo ou editar)
+  // salvar (novo ou editar) - mantive comportamento local
   function handleSave() {
     // validações básicas
     if (!form.enunciado.trim()) {
@@ -595,6 +768,15 @@ export default function App() {
                 Banco de Questões
               </h1>
               <p className="text-slate-500 mt-1">Gerencie suas questões e monte simulados personalizados</p>
+
+              {/* pequeno indicador de origem dos dados */}
+              <div className="mt-2 text-sm">
+                {loadedFromServer ? (
+                  <span className="text-emerald-600">Dados carregados do servidor ({API_BASE})</span>
+                ) : (
+                  <span className="text-slate-500">Usando dados locais / cache (localStorage)</span>
+                )}
+              </div>
             </div>
 
             <div className="flex items-center gap-3">
