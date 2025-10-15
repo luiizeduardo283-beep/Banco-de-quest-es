@@ -1,0 +1,8 @@
+/* src/index.css - Tailwind directives + custom tweaks */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==== Custom utility tweaks ==== */
+.icon-btn {
+  @apply p-2 rounded-md border bg-white inline-flex items-center justify-center transition }
